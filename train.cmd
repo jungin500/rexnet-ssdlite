@@ -1,0 +1,1 @@
+python train.py --backbone-weight weights\rexnetv1_1.0.pth -d C:\Dataset\VOCdevkit\VOC2007 -c 20 -f --half --num-workers 2 --batch-size 128 -p

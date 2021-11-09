@@ -17,6 +17,7 @@ import numpy as np
 
 from mean_average_precision import MetricBuilder
 
+
 class ReXNetSSDBackbone(nn.Module):
     def __init__(self, rexnetv1):
         super(ReXNetSSDBackbone, self).__init__()
@@ -49,10 +50,18 @@ class ReXNetSSDBackbone(nn.Module):
 
 
 class ReXNetSSD(pl.LightningModule):
-    def __init__(self, ssdlite224_rexnet_v1, num_classes):
+    def __init__(self, rexnet_ssd_model = None, num_classes = None):
         super(ReXNetSSD, self).__init__()
-        self.model = ssdlite224_rexnet_v1
-        self.metric_fn = MetricBuilder.build_evaluation_metric("map_2d", async_mode=True, num_classes=3)
+        if rexnet_ssd_model is None and num_classes is None:
+            self.model = ssdlite224_rexnet_v1(
+                backbone_weight_path = None,
+                is_freeze_base_net = None,
+                num_classes = 20
+            )
+        else:
+            self.model = rexnet_ssd_model
+        self.metric_fn = MetricBuilder.build_evaluation_metric(
+            "map_2d", async_mode=True, num_classes=3)
         self.num_classes = num_classes
 
     def forward(self, x):
@@ -62,7 +71,7 @@ class ReXNetSSD(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
-    def training_step(self,training_batch, batch_idx):
+    def training_step(self, training_batch, batch_idx):
         '''
         loss_dict = model(
             torch.zeros(2, 3, 224, 224).cuda(),
@@ -85,14 +94,15 @@ class ReXNetSSD(pl.LightningModule):
         loss = sum(loss for loss in loss_dict.values())
         self.log('train_loss', loss)
         return loss
-    
+
     def on_validation_epoch_start(self):
         self.metric_fn.reset()
 
     def validation_step(self, val_batch, batch_idx):
         image_batch, annotations_batch = val_batch
         # model.eval() is called before validation_step
-        gt_boxes, gt_labels = [m['boxes'] for m in annotations_batch], [m['labels'] for m in annotations_batch]
+        gt_boxes, gt_labels = [m['boxes'] for m in annotations_batch], [
+            m['labels'] for m in annotations_batch]
 
         # Takes too much time
         # self.model.train()
@@ -102,7 +112,7 @@ class ReXNetSSD(pl.LightningModule):
         # loss = sum(loss for loss in loss_dict.values())
         # self.log('valid_loss', loss)
         # self.model.eval()
-        
+
         with torch.no_grad():
             batched_result = self.model(image_batch)
 
@@ -112,25 +122,30 @@ class ReXNetSSD(pl.LightningModule):
                 gt_single_boxes, gt_single_labels = gt_single_boxes.cpu(), gt_single_labels.cpu()
 
                 boxes, scores, labels = single_result['boxes'], single_result['scores'], single_result['labels']
-                boxes, scores, labels = boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy()
-                boxes, scores, labels = boxes, np.expand_dims(scores, 1), np.expand_dims(labels, 1)
+                boxes, scores, labels = boxes.cpu().numpy(
+                ), scores.cpu().numpy(), labels.cpu().numpy()
+                boxes, scores, labels = boxes, np.expand_dims(
+                    scores, 1), np.expand_dims(labels, 1)
                 preds = np.concatenate([boxes, labels, scores], 1)
-                
+
                 # print("Filtered preds size:", filtered_preds.shape)
 
-                gt_single_boxes, gt_single_labels = gt_single_boxes, np.expand_dims(gt_single_labels, 1)
-                gt = np.concatenate([gt_single_boxes, gt_single_labels, np.zeros((gt_single_boxes.shape[0], 2))], 1)
+                gt_single_boxes, gt_single_labels = gt_single_boxes, np.expand_dims(
+                    gt_single_labels, 1)
+                gt = np.concatenate([gt_single_boxes, gt_single_labels, np.zeros(
+                    (gt_single_boxes.shape[0], 2))], 1)
                 # np.zeros(gt_single_boxes.shape[0], 2) -> difficult, crowd
 
                 self.metric_fn.add(preds, gt)
-                
+
             valid_mean_ap = self.metric_fn.value(iou_thresholds=0.5)['mAP']
             self.log('valid_mean_ap', valid_mean_ap)
             return valid_mean_ap
-        
+
     def on_validation_epoch_end(self):
-        logger.info("Validation mAP: %1.4f" % self.metric_fn.value(iou_thresholds=0.5)['mAP'])
-    
+        logger.info("Validation mAP: %1.4f" %
+                    self.metric_fn.value(iou_thresholds=0.5)['mAP'])
+
 
 def ssdlite224_rexnet_v1_lightning(
     **kwargs: Any
@@ -147,9 +162,12 @@ def ssdlite224_rexnet_v1(
 ):
     backbone = ReXNetV1()
     if is_freeze_base_net:
+        logger.info("Disabling updates on backbone")
         for param in backbone.parameters():
             param.requires_grad = False
-            
+    else:
+        logger.info("Enabling updates on backbone")
+
     # Load weight
     if backbone_weight_path is not None:
         backbone.load_state_dict(torch.load(backbone_weight_path))
@@ -157,7 +175,8 @@ def ssdlite224_rexnet_v1(
 
     norm_layer = partial(nn.BatchNorm2d, eps=0.001, momentum=0.03)
     size = (320, 320)
-    anchor_generator = DefaultBoxGenerator([[2, 3] for _ in range(6)], min_ratio=0.2, max_ratio=0.95)
+    anchor_generator = DefaultBoxGenerator(
+        [[2, 3] for _ in range(6)], min_ratio=0.2, max_ratio=0.95)
     out_channels = det_utils.retrieve_out_channels(backbone, size)
     num_anchors = anchor_generator.num_anchors_per_location()
     assert len(out_channels) == len(anchor_generator.aspect_ratios)
@@ -183,6 +202,7 @@ def ssdlite224_rexnet_v1(
     )
 
     return model
+
 
 def collate_batch(batch):
     return tuple(zip(*batch))

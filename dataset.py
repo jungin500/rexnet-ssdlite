@@ -10,7 +10,7 @@ import cv2
 import glob
 
 
-def parse_annotation(data_root, folds, num_classes):
+def parse_annotation(data_root, folds, size, num_classes):
     fold_item_list = open(os.path.join(
         data_root, 'ImageSets', 'Main', folds + '.txt')).read().splitlines()
 
@@ -42,6 +42,9 @@ def parse_annotation(data_root, folds, num_classes):
             bndbox_dom = object_dom.find('bndbox')
             xmin, ymin, xmax, ymax = [int(bndbox_dom.find(k).text) for k in [
                 'xmin', 'ymin', 'xmax', 'ymax']]
+            
+            xmin, xmax = xmin / img_width * size[0], xmax / img_width * size[0]
+            ymin, ymax = ymin / img_height * size[1], ymax / img_height * size[1]
 
             boxes.append(np.array([xmin, ymin, xmax, ymax]))
             labels.append(object_name)
@@ -162,7 +165,7 @@ class VOCDetectionDataset(Dataset):
         self.class_map = class_map
         self.transform = transform
         self.cache = cache
-        self.items = parse_annotation(data_root, folds, num_classes)
+        self.items = parse_annotation(data_root, folds, size, num_classes)
         if self.cache:
             self.images = preload_caches(
                 './image_cache.array', self.items, size[0], size[1])
@@ -193,3 +196,67 @@ class VOCDetectionDataset(Dataset):
             tensor = tensor.half()
 
         return tensor, annotation
+
+if __name__ == '__main__':
+    from torch.utils.data import DataLoader
+    from model import collate_batch
+    
+    logger.info("Checking dataloader")
+    
+    dataset = VOCDetectionDataset(
+        data_root='/mnt/windows-11/Dataset/VOCdevkit/VOC2007',
+        folds='trainval',
+        num_classes=20,
+        cache=False,
+        class_map=None,
+        transform=None,
+        size=(416, 416)
+    )
+    
+    trainset_items = int(len(dataset) * 0.9)
+    validset_items = len(dataset) - trainset_items
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [trainset_items, validset_items])
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=2,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collate_batch
+    )
+    
+    image_batch, annotation_batch = next(iter(train_loader))
+    print("Image length: %d, Shape: %s" % (len(image_batch), image_batch[0].shape))
+    print(annotation_batch)
+    
+    for idx in range(len(image_batch)):
+        image, annotation = image_batch[idx], annotation_batch[idx]
+        
+        image = image.numpy()
+        image *= np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        image += np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        image = np.transpose(image, (1, 2, 0))
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        image = (image * 255.0).astype(np.uint8)
+        image = cv2.resize(image, (800, 800))  # bigger size
+        
+        # draw annotations
+        '''
+        [{'boxes': tensor([[  4.,  16., 400., 400.]]), 'labels': tensor([0])}, {'boxes': tensor([[ 61.,  57., 292., 189.],
+        [340.,  79., 410., 228.],
+        [  1.,  32.,  72., 295.]]), 'labels': tensor([18, 14, 14])}]
+        '''
+        boxes, labels = annotation['boxes'], annotation['labels']
+        boxes, labels = boxes.numpy(), labels.numpy()
+        
+        for box_idx in range(boxes.shape[0]):
+            xmin, ymin, xmax, ymax = boxes[box_idx]
+            xmin, ymin, xmax, ymax = [int(k / 416 * 800) for k in [xmin, ymin, xmax, ymax]]  # 416 -> 800
+            label_id = labels[box_idx]
+            
+            cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+        
+        cv2.imshow("Image", image)
+        cv2.waitKey(0)
+    

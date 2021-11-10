@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 
 from typing import *
 
-from rexnetv1 import ReXNetV1, LinearBottleneck
+from rexnetv1 import ReXNetV1, LinearBottleneck, SiLU
 from loguru import logger
 
 import torch
@@ -18,10 +18,37 @@ import numpy as np
 from mean_average_precision import MetricBuilder
 
 
+def hack_inner2d_out(module, x):
+    '''RexNetV1-related hacks
+    
+    '''
+    modules_to_forward = module[:-1]
+    last_module = module[-1]  # LinearBottleneck
+    last_module_seq = last_module.out  # Sequential
+    until_se_module_relu6_out = last_module_seq[:7]
+    remainders = last_module_seq[7:]
+    
+    x = modules_to_forward(x)
+    x = until_se_module_relu6_out(x)
+    y = remainders(x)
+    return x, y
+    
+
 class ReXNetSSDBackbone(nn.Module):
     def __init__(self, rexnetv1):
         super(ReXNetSSDBackbone, self).__init__()
-        self.backbone = rexnetv1.features[:-9]
+        self.backbone_features = rexnetv1.features
+        self.feature0_head = nn.Sequential(
+            nn.Conv2d(in_channels=702, out_channels=672, kernel_size=(3, 3), padding=1, groups=1, bias=False),
+            nn.BatchNorm2d(num_features=672),
+            SiLU()
+        )
+        self.feature1_head = nn.Sequential(
+            nn.Conv2d(in_channels=1044, out_channels=480, kernel_size=(3, 3), padding=1, groups=1, bias=False),
+            nn.BatchNorm2d(num_features=480),
+            SiLU()
+        )
+        
         self.backbone_tails = nn.ModuleList([
             LinearBottleneck(
                 in_channels=in_c,
@@ -31,9 +58,7 @@ class ReXNetSSDBackbone(nn.Module):
                 use_se=se,
                 se_ratio=se_ratio
             ) for in_c, c, t, s, se, se_ratio in [
-                (128, 672, 1, 1, False, 12),
-                (672, 480, 1, 2, False, 12),
-                (480, 512, 1, 2, False, 12),
+                (185, 512, 1, 2, False, 12),
                 (512, 256, 1, 2, False, 12),
                 (256, 256, 1, 2, False, 12),
                 (256, 128, 1, 1, False, 12),
@@ -41,16 +66,25 @@ class ReXNetSSDBackbone(nn.Module):
         ])
 
     def forward(self, x):
-        x = self.backbone(x)
+        x14_inner_relu6_out, x = hack_inner2d_out(self.backbone_features[:-9], x)  # [1, 702, 14, 14] (ReLU6 applied), [1, 128, 14, 14]
+        x7_inner_relu6_out, x = hack_inner2d_out(self.backbone_features[-9:-4], x)  # [1, 1044, 7, 7] (ReLU6 applied), [1, 185, 7, 7]
+        
+        # First two heads will use x14, x7 outputs
         result_dicts = {}
+        
+        feature0 = self.feature0_head(x14_inner_relu6_out)
+        feature1 = self.feature1_head(x7_inner_relu6_out)
+        result_dicts['0'] = feature0
+        result_dicts['1'] = feature1
+        
         for idx in range(len(self.backbone_tails)):
             x = self.backbone_tails[idx](x)
-            result_dicts[str(idx)] = x
+            result_dicts[str(idx + 2)] = x  # idx should begin from 2
         return result_dicts
 
 
 class ReXNetSSD(pl.LightningModule):
-    def __init__(self, rexnet_ssd_model = None, num_classes = None):
+    def __init__(self, batch_size, rexnet_ssd_model = None, num_classes = None):
         super(ReXNetSSD, self).__init__()
         if rexnet_ssd_model is None and num_classes is None:
             self.model = ssdlite224_rexnet_v1(
@@ -63,6 +97,7 @@ class ReXNetSSD(pl.LightningModule):
         self.metric_fn = MetricBuilder.build_evaluation_metric(
             "map_2d", async_mode=True, num_classes=3)
         self.num_classes = num_classes
+        self.batch_size = batch_size
 
     def forward(self, x):
         return self.model(x)
@@ -88,11 +123,11 @@ class ReXNetSSD(pl.LightningModule):
         '''
         image_batch, annotations_batch = training_batch
         loss_dict = self.model(image_batch, annotations_batch)
-        self.log('train_loss_bbox_regression', loss_dict['bbox_regression'])
-        self.log('train_loss_classification', loss_dict['classification'])
+        self.log('train_loss_bbox_regression', loss_dict['bbox_regression'], batch_size=self.batch_size)
+        self.log('train_loss_classification', loss_dict['classification'], batch_size=self.batch_size)
 
         loss = sum(loss for loss in loss_dict.values())
-        self.log('train_loss', loss)
+        self.log('train_loss', loss, batch_size=self.batch_size)
         return loss
 
     def on_validation_epoch_start(self):
@@ -139,7 +174,7 @@ class ReXNetSSD(pl.LightningModule):
                 self.metric_fn.add(preds, gt)
 
             valid_mean_ap = self.metric_fn.value(iou_thresholds=0.5)['mAP']
-            self.log('valid_mean_ap', valid_mean_ap)
+            self.log('valid_mean_ap', valid_mean_ap, batch_size=self.batch_size)
             return valid_mean_ap
 
     def on_validation_epoch_end(self):
@@ -148,10 +183,11 @@ class ReXNetSSD(pl.LightningModule):
 
 
 def ssdlite224_rexnet_v1_lightning(
+    batch_size,
     **kwargs: Any
 ):
     model = ssdlite224_rexnet_v1(**kwargs)
-    return ReXNetSSD(model, kwargs['num_classes'])
+    return ReXNetSSD(batch_size, model, kwargs['num_classes'])
 
 
 def ssdlite224_rexnet_v1(

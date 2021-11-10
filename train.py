@@ -47,6 +47,7 @@ def main(args):
 
     # Main network
     model = ssdlite224_rexnet_v1_lightning(
+        batch_size=batch_size,
         backbone_weight_path=backbone_weight_path,
         is_freeze_base_net=is_freeze_base_net,
         num_classes=num_classes

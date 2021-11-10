@@ -193,3 +193,5 @@ weights/
 *.zip
 *.txt
 *.ipynb
+**/*.array
+**/*.ckpt
